@@ -1,3 +1,4 @@
+
 #include <stdio.h>
 #include <sys/time.h>
 #include <time.h>
@@ -7,12 +8,16 @@
 #include <signal.h>
 #include <unistd.h> // for isatty
 #include <stdarg.h>
-#include <stdint.h>
 
 #define DISABLE_OPENCV_24_COMPATIBILITY
 #include <opencv2/imgproc/imgproc.hpp>
+#include <opencv2/opencv.hpp>
+#include <opencv2/core.hpp>     // Basic OpenCV structures (cv::Mat)
+#include <opencv2/videoio.hpp>  // Video write
 
 #include "ASICamera2.h"
+
+using namespace std;
 
 // Format: https://en.cppreference.com/w/c/io/fprintf
 void imgPrintf(cv::InputOutputArray img, const char* format, ...)
@@ -79,6 +84,7 @@ struct options {
 	int64_t duration;
 	long exposure_ms;
 	bool gain_auto;
+	bool exposure_auto;
 	long gain;
 	ASI_IMG_TYPE asi_image_type;
 	int cv_array_type;
@@ -90,14 +96,15 @@ void parse_command_line(int argc, char **argv, options *dest)
 
 	// Set defaults
 	dest->duration = -1;
-	dest->exposure_ms = 500;
+	dest->exposure_ms = 0;
+	dest->exposure_auto = false;
 	dest->gain_auto = false;
 	dest->gain = 50;
 	dest->asi_image_type = ASI_IMG_RAW8;
 	dest->cv_array_type = CV_8UC1;
 	dest->verbose = false;
 
-	while ((optc = getopt(argc, argv, "hd:e:Gg:p:v")) != -1)
+	while ((optc = getopt(argc, argv, "hd:Ee:Gg:p:v:")) != -1)
 	{
 		switch (optc) {
 		case 'd':
@@ -118,6 +125,9 @@ void parse_command_line(int argc, char **argv, options *dest)
 			break;
 		case 'e':
 			dest->exposure_ms = atoi(optarg);
+			break;
+		case 'E':
+			dest->exposure_auto = true;
 			break;
 		case 'G':
 			dest->gain_auto = true;
@@ -146,6 +156,7 @@ void parse_command_line(int argc, char **argv, options *dest)
 		case '?':
 			printf("Usage: %s\n" \
 			"  -d {duration} Stop streaming after this time (examples 3600s, 60m, 1h) (default infinite)\n"
+			"  -E Enable auto exposure (default off)\n"
 			"  -e {exposure time} Set exposure time in ms (default 500 ms)\n"
 			"  -G Enable auto gain (default off)\n"
 			"  -g {gain (0-100)} Set gain or the initial gain if auto gain is enabled (default 50)\n"
@@ -215,15 +226,19 @@ int main(int argc, char **argv)
 	}
 
 	int fDropCount = 0;
+	int fps = 10;
 	unsigned long fpsCount = 0, fCount = 0;
 	long exp = opt.exposure_ms * 1000;
 	long gain = opt.gain;
 	long sensorTemp;
 
-	ASISetControlValue(CamInfo.CameraID, ASI_EXPOSURE, exp, ASI_FALSE);
+	const string args = "appsrc ! videoconvert ! vaapih264enc speed-preset=superfast bitrate=1000 key-int-max=40 ! rtspclientsink location=rtsp://localhost:8554/live.sdp";
+
+	ASISetControlValue(CamInfo.CameraID, ASI_EXPOSURE, exp, opt.exposure_auto ? ASI_TRUE : ASI_FALSE);
 	ASISetControlValue(CamInfo.CameraID, ASI_GAIN, gain, opt.gain_auto ? ASI_TRUE : ASI_FALSE);
-	ASISetControlValue(CamInfo.CameraID, ASI_AUTO_MAX_GAIN, 100, ASI_TRUE);
-	//ASISetControlValue(CamInfo.CameraID, ASI_BANDWIDTHOVERLOAD, 60, ASI_FALSE); // transfer speed percentage
+	ASISetControlValue(CamInfo.CameraID, ASI_AUTO_MAX_GAIN, 80, ASI_TRUE);
+	ASISetControlValue(CamInfo.CameraID, ASI_AUTO_MAX_EXP, 100, ASI_TRUE);
+	ASISetControlValue(CamInfo.CameraID, ASI_BANDWIDTHOVERLOAD, 60, ASI_TRUE); // transfer speed percentage
 	//ASISetControlValue(CamInfo.CameraID, ASI_HIGH_SPEED_MODE, 0, ASI_FALSE);
 
 	if (CamInfo.IsTriggerCam)
@@ -236,10 +251,10 @@ int main(int argc, char **argv)
 			fprintf(stderr, "Set mode failed!\n");
 	}
 
-	if (isatty(fileno(stdout))) {
-		fprintf(stderr, "stdout is a tty, will not dump video data\n");
-		exit_mainloop = true;
-	}
+	//if (isatty(fileno(stdout))) {
+	//	fprintf(stderr, "stdout is a tty, will not dump video data\n");
+	//	exit_mainloop = true;
+	//}
 
 	// RAW8: use ffmpeg -pixel_format gray8
 	// RAW16: use ffmpeg -pixel_format gray12le
@@ -247,10 +262,11 @@ int main(int argc, char **argv)
 	//   ./zwostream -p RAW8 | ffmpeg -f rawvideo -pixel_format gray8 -vcodec rawvideo -video_size 1280x960 -i pipe:0
 	ASISetROIFormat(CamInfo.CameraID, CamInfo.MaxWidth, CamInfo.MaxHeight, 1, opt.asi_image_type);
 	cv::Mat img(CamInfo.MaxHeight, CamInfo.MaxWidth, opt.cv_array_type);
+	cv::VideoWriter out(args, cv::CAP_GSTREAMER, 0, fps, cv::Size(CamInfo.MaxWidth, CamInfo.MaxHeight), false);
 
 	ASIStartVideoCapture(CamInfo.CameraID);
 	int64_t end_time = opt.duration != -1 ? get_highres_time() + opt.duration : -1;
-	while (!exit_mainloop && ((end_time == -1) || (end_time - get_highres_time() > 0)))
+	while (!exit_mainloop && ((end_time == -1)))
 	{
 		ASI_ERROR_CODE code;
 		ASI_BOOL bVal;
@@ -258,24 +274,28 @@ int main(int argc, char **argv)
 		code = ASIGetVideoData(CamInfo.CameraID, img.data, img.elemSize()*img.size().area(), 2000);
 		if (code != ASI_SUCCESS) {
 			fprintf(stderr, "ASIGetVideoData() error: %d\n", code);
-			exit(EXIT_FAILURE);
-		}
-		fCount++;
-		fpsCount++;
-		ASIGetControlValue(CamInfo.CameraID, ASI_GAIN, &gain, &bVal);
-		ASIGetControlValue(CamInfo.CameraID, ASI_EXPOSURE, &exp, &bVal);
-		ASIGetControlValue(CamInfo.CameraID, ASI_TEMPERATURE, &sensorTemp, &bVal);
-		ASIGetDroppedFrames(CamInfo.CameraID, &fDropCount);
+//			exit(EXIT_FAILURE);
+		} else {
+			fCount++;
+			fpsCount++;
+			ASIGetControlValue(CamInfo.CameraID, ASI_GAIN, &gain, &bVal);
+			ASIGetControlValue(CamInfo.CameraID, ASI_EXPOSURE, &exp, &bVal);
+			ASIGetControlValue(CamInfo.CameraID, ASI_TEMPERATURE, &sensorTemp, &bVal);
+			ASIGetDroppedFrames(CamInfo.CameraID, &fDropCount);
 
-		char timestamp[20] = {0};
-		struct tm *tmp;
-		time_t t = time(NULL);
-		tmp = gmtime(&t);
-		strftime(timestamp, sizeof(timestamp), "%Y%m%d %H%M%SZ", tmp);
-		imgPrintf(img, "%s Gain:%ld Exp:%ldms Frame:%lu Dropped:%u Temp:%.0fC",
-			timestamp, gain, exp/1000, fCount, fDropCount, sensorTemp/10.0);
-		fwrite(img.data, img.elemSize(), img.size().area(), stdout);
-		fflush(stdout);
+			char timestamp[20] = {0};
+			struct tm *tmp;
+			time_t t = time(NULL);
+			tmp = gmtime(&t);
+			strftime(timestamp, sizeof(timestamp), "%Y%m%d %H%M%SZ", tmp);
+			imgPrintf(img, "%s Gain:%ld Exp:%ldms Frame:%lu Dropped:%u Temp:%.0fC",
+				timestamp, gain, exp/1000, fCount, fDropCount, sensorTemp/10.0);
+//			cv::imwrite(opt.location, img, {cv::ImwriteFlags::IMWRITE_JPEG_QUALITY, 50});
+			out.write(img);
+			sleep(1/fps);
+//			fwrite(img.data, img.elemSize(), img.size().area(), stdout);
+//			fflush(stdout);
+		}
 	}
 	ASIStopVideoCapture(CamInfo.CameraID);
 

@@ -1,5 +1,5 @@
 ver = debug
-platform := $(shell uname -m)
+platform := x64
 
 # Raspberry Pi in 32-bit LE mode
 ifeq ($(platform), armv7l)
@@ -25,7 +25,7 @@ CFLAGS += -m64
 CFLAGS += -lrt
 endif
 
-CFLAGS += -L./sdk/lib/$(platform) -I./sdk/include -pedantic -Wimplicit-fallthrough -Wall -Werror -lopencv_core -lopencv_highgui -lopencv_imgproc
+CFLAGS += -L./sdk/lib/$(platform) -I./sdk/include -pedantic -Wimplicit-fallthrough -Wall -Werror -lopencv_core -lopencv_highgui -lopencv_imgproc -lopencv_imgcodecs -lopencv_videoio
 
 zwostream: main.cpp Makefile
 	$(CC) main.cpp -o zwostream $(CFLAGS) -lASICamera2 -Wl,-rpath=. -Wl,-rpath=./sdk/lib/$(platform)
